@@ -1,0 +1,21 @@
+title: Dungeon Generator
+version: 0.0.1
+author: MrJuaumBR
+tags:
+- procedural
+- dungeon
+- generator
+- medieval-themed
+type: app
+description: A Dungeon generator application
+main_file: app.py
+icon: icon.png
+banner: null
+color1: "#6495ed"
+color2: "#5a5a8f"
+contacts: {}
+args:
+  fullscreen: true
+  debug: true
+save_type: file
+save_data_path: saves.json

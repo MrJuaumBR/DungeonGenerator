@@ -1,4 +1,6 @@
 dungeon.json
+saves.json
+dungeon_*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

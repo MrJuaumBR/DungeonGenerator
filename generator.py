@@ -6,6 +6,7 @@ from enum import Enum
 from collections import deque
 import numpy as np
 
+_MAX_SEED = 2**32 - 1
 
 class RoomType(Enum):
     SPAWN = 0
@@ -15,6 +16,8 @@ class RoomType(Enum):
     STAIR_UP = 4
     STAIR_DOWN = 5
 
+def ClampSeed(seed:int) -> int:
+    return seed % (_MAX_SEED + 1)
 
 class Connection:
     def __init__(self, id: str, room1: 'Room', room2: 'Room', weight: int = 1):
@@ -22,7 +25,6 @@ class Connection:
         self.room1 = room1
         self.room2 = room2
         self.weight = weight
-
 
 class Room:
     def __init__(self, position: Tuple[int, int], room_type: RoomType = RoomType.NORMAL):
@@ -32,7 +34,6 @@ class Room:
         self.room_type = room_type
         self.distance: Optional[int] = None
 
-
 class Floor:
     def __init__(self, level: int, width: int, height: int):
         self.level = level
@@ -41,11 +42,16 @@ class Floor:
         self.rooms: List[Room] = []
         self.connections: List[Connection] = []
         self.grid: Optional[np.ndarray] = None
+        self._grid_cache: Optional[np.ndarray] = None
         self.stair_up: Optional[Room] = None
         self.stair_down: Optional[Room] = None
         self.entry: Optional[Room] = None
 
     def get_grid(self, carve_corridors: bool = True) -> np.ndarray:
+        if self._grid_cache is not None:
+            return self._grid_cache
+
+        # Build the grid with room symbols
         grid = np.full((self.width, self.height), '.', dtype='U1')
         for room in self.rooms:
             x, y = room.position
@@ -59,17 +65,26 @@ class Floor:
                     RoomType.NORMAL: 'X',
                 }.get(room.room_type, 'X')
                 grid[x, y] = symbol
+
         if carve_corridors:
             self._carve_corridors(grid)
+
         self.grid = grid
+        self._grid_cache = grid
         return grid
 
     def _carve_corridors(self, grid: np.ndarray):
+        """Carve L‑shaped corridors deterministically (no randomness)."""
         room_positions = {room.position for room in self.rooms}
+
         for conn in self.connections:
             (x1, y1) = conn.room1.position
             (x2, y2) = conn.room2.position
-            if random.choice([True, False]):
+
+            # Decide horizontal‑first based on room IDs (deterministic)
+            # Use a simple rule: if room1.id < room2.id, horizontal first, else vertical first
+            if conn.room1.id < conn.room2.id:
+                # Horizontal then vertical
                 for x in range(min(x1, x2), max(x1, x2) + 1):
                     if (x, y1) not in room_positions:
                         grid[x, y1] = '#'
@@ -77,6 +92,7 @@ class Floor:
                     if (x2, y) not in room_positions:
                         grid[x2, y] = '#'
             else:
+                # Vertical then horizontal
                 for y in range(min(y1, y2), max(y1, y2) + 1):
                     if (x1, y) not in room_positions:
                         grid[x1, y] = '#'
@@ -119,7 +135,6 @@ class Floor:
             'grid': [[str(self.get_grid()[x, y]) for x in range(self.width)] for y in range(self.height)]
         }
 
-
 class Generator:
     def __init__(self, width: int, height: int, min_rooms: int, max_rooms: int,
                  min_floors: int = 1, max_floors: int = 1,
@@ -127,7 +142,7 @@ class Generator:
                  seed: Optional[int] = None):
         if seed is None:
             seed = int(time.time() * 100)
-        self.seed = seed
+        self.seed = ClampSeed(seed)
         self.width = width
         self.height = height
         self.min_rooms = min_rooms
@@ -355,21 +370,21 @@ class Generator:
         # - STAIR_UP never connects to D, B, E; and must have at least one NORMAL connection
         # - Every room (except END) must have at least one connection
 
-        # 4a. Enforce END rule
         end_room = next((r for r in rooms if r.room_type == RoomType.END), None)
         boss_room = next((r for r in rooms if r.room_type == RoomType.BOSS), None)
+
         if end_room and boss_room:
             self._enforce_end_room_rule(floor, end_room, boss_room)
 
-        # 4b. Enforce BOSS connection to X (if missing)
         if boss_room:
             self._enforce_boss_connections(floor, boss_room, end_room)
 
-        # 4c. Enforce U rule (remove D, B, E connections; add X if none)
         self._enforce_stair_connection_rule(floor)
 
-        # 4d. Final safety: any room (except END) with 0 connections gets a connection to nearest valid room
         self._ensure_all_connected(floor)
+
+        # ---- NEW: Final connectivity guarantee after all rules ----
+        self._ensure_floor_connected(floor)
 
     # ---------- Rule enforcement helpers ----------
     def _enforce_end_room_rule(self, floor: Floor, end_room: Room, boss_room: Room):
@@ -396,11 +411,7 @@ class Generator:
             boss_room.connections.append(new_conn)
 
     def _enforce_boss_connections(self, floor: Floor, boss_room: Room, end_room: Optional[Room]):
-        # Ensure boss has exactly 2 connections: one to END (already), one to a NORMAL room
-        # First, gather current boss connections
         boss_conns = [c for c in floor.connections if c.room1 == boss_room or c.room2 == boss_room]
-
-        # Identify connection to END
         end_conn = None
         other = []
         for c in boss_conns:
@@ -410,11 +421,8 @@ class Generator:
             else:
                 other.append(c)
 
-        # We need exactly one connection to a NORMAL room (not END)
-        # Find a NORMAL room to connect to
         normal_rooms = [r for r in floor.rooms if r.room_type == RoomType.NORMAL and r != boss_room]
 
-        # Remove all connections except end_conn
         for c in other:
             floor.connections.remove(c)
             if c in boss_room.connections:
@@ -424,12 +432,9 @@ class Generator:
             if c in c.room2.connections:
                 c.room2.connections.remove(c)
 
-        # If we don't have a connection to a NORMAL room, add one
         if normal_rooms:
-            # Find nearest NORMAL room
             nearest = min(normal_rooms, key=lambda r: abs(r.position[0] - boss_room.position[0]) +
                           abs(r.position[1] - boss_room.position[1]))
-            # Check if already connected (shouldn't be)
             already = False
             for c in boss_room.connections:
                 other_room = c.room2 if c.room1 == boss_room else c.room1
@@ -442,8 +447,6 @@ class Generator:
                 boss_room.connections.append(new_conn)
                 nearest.connections.append(new_conn)
 
-        # Now ensure boss has exactly 2 connections (should be end_conn + one normal)
-        # If end_conn is None, we need to create it (should have been done in END rule)
         if end_conn is None and end_room is not None:
             new_conn = Connection(f'boss-end-{len(floor.connections)}', boss_room, end_room)
             floor.connections.append(new_conn)
@@ -455,7 +458,6 @@ class Generator:
         if stair_up is None:
             return
 
-        # Remove connections to D, B, E
         stair_conns = [c for c in floor.connections if c.room1 == stair_up or c.room2 == stair_up]
         forbidden_types = {RoomType.STAIR_DOWN, RoomType.BOSS, RoomType.END}
         to_remove = []
@@ -473,7 +475,6 @@ class Generator:
             if conn in conn.room2.connections:
                 conn.room2.connections.remove(conn)
 
-        # If U has no connections, connect to nearest NORMAL room
         if len(stair_up.connections) == 0:
             normal_rooms = [r for r in floor.rooms if r.room_type == RoomType.NORMAL and r != stair_up]
             if normal_rooms:
@@ -487,19 +488,19 @@ class Generator:
     def _ensure_all_connected(self, floor: Floor):
         """Connect any isolated rooms (except END) to the nearest valid room."""
         end_room = next((r for r in floor.rooms if r.room_type == RoomType.END), None)
+        boss_room = next((r for r in floor.rooms if r.room_type == RoomType.BOSS), None)
         for room in floor.rooms:
             if room == end_room:
                 continue
             if len(room.connections) == 0:
-                # Find nearest room (excluding self, excluding END, and not BOSS if it would break its degree?)
-                # For simplicity, connect to any room that is not END
                 best = None
                 best_dist = float('inf')
                 for other in floor.rooms:
                     if other == room or other == end_room:
                         continue
-                    # Avoid connecting to BOSS if it already has 2 connections? But we can allow; it might be okay.
-                    # We'll keep it simple.
+                    # Avoid connecting to BOSS if it already has 2 connections
+                    if other == boss_room and len(other.connections) >= 2:
+                        continue
                     d = abs(room.position[0] - other.position[0]) + abs(room.position[1] - other.position[1])
                     if d < best_dist:
                         best_dist = d
@@ -509,6 +510,68 @@ class Generator:
                     floor.connections.append(new_conn)
                     room.connections.append(new_conn)
                     best.connections.append(new_conn)
+
+    # ---------- NEW: Final connectivity guarantee ----------
+    def _ensure_floor_connected(self, floor: Floor):
+        """Guarantee the entire floor is one connected component."""
+        rooms = floor.rooms
+        if len(rooms) < 2:
+            return
+
+        # Build adjacency from current connections
+        adj: Dict[Room, List[Room]] = {r: [] for r in rooms}
+        for conn in floor.connections:
+            adj[conn.room1].append(conn.room2)
+            adj[conn.room2].append(conn.room1)
+
+        all_rooms = set(rooms)
+        visited = set()
+        queue = deque([rooms[0]])
+        visited.add(rooms[0])
+
+        while queue:
+            curr = queue.popleft()
+            for nb in adj.get(curr, []):
+                if nb not in visited:
+                    visited.add(nb)
+                    queue.append(nb)
+
+        unvisited = all_rooms - visited
+        end_room = next((r for r in rooms if r.room_type == RoomType.END), None)
+
+        while unvisited:
+            best_dist = float('inf')
+            best_pair = None
+            for v in visited:
+                for u in unvisited:
+                    # Avoid connecting to END if possible
+                    if u == end_room:
+                        continue
+                    d = abs(v.position[0] - u.position[0]) + abs(v.position[1] - u.position[1])
+                    if d < best_dist:
+                        best_dist = d
+                        best_pair = (v, u)
+            # If only END left, connect it
+            if best_pair is None:
+                for v in visited:
+                    for u in unvisited:
+                        d = abs(v.position[0] - u.position[0]) + abs(v.position[1] - u.position[1])
+                        if d < best_dist:
+                            best_dist = d
+                            best_pair = (v, u)
+            if best_pair:
+                a, b = best_pair
+                new_id = f'conn-bridge-{len(floor.connections)}'
+                new_conn = Connection(new_id, a, b)
+                floor.connections.append(new_conn)
+                a.connections.append(new_conn)
+                b.connections.append(new_conn)
+                adj[a].append(b)
+                adj[b].append(a)
+                visited.add(b)
+                unvisited.remove(b)
+            else:
+                break
 
     # ---------- Helpers ----------
     def _pick_edge_room(self, floor: Floor) -> Room:
@@ -542,7 +605,6 @@ class Generator:
         with open(filename, 'w') as f:
             json.dump(data, f, indent=4)
         print(f"Exported to {filename}")
-
 
 # ---------- Demo ----------
 if __name__ == '__main__':
